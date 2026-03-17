@@ -26,7 +26,7 @@ def load_preprocessed_data():
 
 
 def train_model():
-    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    mlflow.set_tracking_uri("")
     mlflow.set_experiment("Breast_Cancer_Classification")
 
     X_train, X_test, y_train, y_test = load_preprocessed_data()

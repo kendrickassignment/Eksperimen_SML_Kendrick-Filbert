@@ -1,12 +1,12 @@
 """
 Inference API - Kendrick Filbert
 ==================================
-Flask API untuk serving model + Prometheus metrics (12 metriks).
+Flask API untuk serving model ML dari MLflow artifact + Prometheus metrics (12 metriks).
 
 Endpoints:
-- POST /predict  : Prediksi
-- GET  /health   : Health check
-- GET  /metrics  : Prometheus metrics
+- POST /predict : Prediksi
+- GET /health : Health check
+- GET /metrics : Prometheus metrics
 """
 
 import pandas as pd
@@ -14,6 +14,7 @@ import numpy as np
 from flask import Flask, request, jsonify
 import time
 import os
+import glob
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -45,38 +46,67 @@ REQUEST_SIZE = Histogram('ml_request_feature_count', 'Feature count per request'
     buckets=[5, 10, 15, 20, 25, 30, 35])
 
 # ============================================================
-# Model Loading
+# Model Loading from MLflow Artifact
 # ============================================================
 model = None
+
+def find_mlflow_model_path():
+    """Auto-detect the latest MLflow model artifact path from mlruns/"""
+    search_paths = [
+        os.path.join("..", "Membangun_model", "mlruns"),
+        "mlruns",
+    ]
+    for base in search_paths:
+        if os.path.exists(base):
+            # Find all model.pkl files
+            pattern = os.path.join(base, "**", "artifacts", "model", "model.pkl")
+            matches = glob.glob(pattern, recursive=True)
+            if matches:
+                # Return the directory containing model.pkl (the "model" folder)
+                model_dir = os.path.dirname(matches[-1])
+                return model_dir
+    return None
 
 def load_model():
     global model
     try:
-        # Fallback: train a model on the spot
-        from sklearn.ensemble import RandomForestClassifier
-        from sklearn.datasets import load_breast_cancer
-        from sklearn.preprocessing import StandardScaler
+        import mlflow.pyfunc
 
-        cancer = load_breast_cancer()
-        X = pd.DataFrame(cancer.data, columns=cancer.feature_names)
-        y = cancer.target
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
-        model.fit(X_scaled, y)
-        MODEL_LOADED.set(1)
-        print("[INFO] Model loaded successfully!")
+        # Try loading from MLflow artifact
+        model_path = find_mlflow_model_path()
+        if model_path:
+            print(f"[INFO] Found MLflow model at: {model_path}")
+            model = mlflow.pyfunc.load_model(model_path)
+            MODEL_LOADED.set(1)
+            print("[INFO] Model loaded from MLflow artifact successfully!")
+            return
+
+        # If no local artifact, try loading from mlruns URI
+        print("[WARN] No local model found, checking MLflow runs...")
+        import mlflow
+        mlflow.set_tracking_uri("")
+        runs = mlflow.search_runs(experiment_names=["Breast_Cancer_Classification"],
+                                   order_by=["start_time DESC"], max_results=1)
+        if not runs.empty:
+            run_id = runs.iloc[0]["run_id"]
+            model_uri = f"runs:/{run_id}/model"
+            print(f"[INFO] Loading model from run: {run_id}")
+            model = mlflow.pyfunc.load_model(model_uri)
+            MODEL_LOADED.set(1)
+            print("[INFO] Model loaded from MLflow run successfully!")
+            return
+
+        raise FileNotFoundError("No MLflow model artifact found")
+
     except Exception as e:
         MODEL_LOADED.set(0)
         print(f"[ERROR] Failed to load model: {e}")
         raise
 
-
 @app.route('/health', methods=['GET'])
 def health():
     REQUEST_COUNT.labels(method='GET', endpoint='/health', status='200').inc()
     return jsonify({"status": "healthy", "model_loaded": model is not None, "author": "Kendrick Filbert"})
-
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -100,8 +130,28 @@ def predict():
         INPUT_FEATURE_MEAN.labels(feature_group='worst_features').set(float(np.mean(features[:, 20:30])))
 
         inference_start = time.time()
-        predictions = model.predict(features)
-        probabilities = model.predict_proba(features)
+
+        # MLflow pyfunc model needs proper column names
+        FEATURE_NAMES = [
+            'mean radius', 'mean texture', 'mean perimeter', 'mean area', 'mean smoothness',
+            'mean compactness', 'mean concavity', 'mean concave points', 'mean symmetry', 'mean fractal dimension',
+            'radius error', 'texture error', 'perimeter error', 'area error', 'smoothness error',
+            'compactness error', 'concavity error', 'concave points error', 'symmetry error', 'fractal dimension error',
+            'worst radius', 'worst texture', 'worst perimeter', 'worst area', 'worst smoothness',
+            'worst compactness', 'worst concavity', 'worst concave points', 'worst symmetry', 'worst fractal dimension'
+        ]
+        features_df = pd.DataFrame(features, columns=FEATURE_NAMES)
+        raw_predictions = model.predict(features_df)
+        predictions = np.array(raw_predictions).flatten()
+
+        # For probability, use the underlying sklearn model
+        sklearn_model = model._model_impl.sklearn_model if hasattr(model, '_model_impl') else None
+        if sklearn_model and hasattr(sklearn_model, 'predict_proba'):
+            probabilities = sklearn_model.predict_proba(features)
+        else:
+            # Fallback: create dummy probabilities from predictions
+            probabilities = np.array([[1 - p, p] for p in predictions])
+
         inference_duration = time.time() - inference_start
         INFERENCE_TIME.observe(inference_duration)
 
@@ -137,18 +187,17 @@ def predict():
         ACTIVE_REQUESTS.dec()
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/metrics', methods=['GET'])
 def metrics():
     return generate_latest(REGISTRY), 200, {'Content-Type': CONTENT_TYPE_LATEST}
-
 
 if __name__ == '__main__':
     print("=" * 50)
     print("BREAST CANCER CLASSIFICATION API")
     print("Author: Kendrick Filbert")
+    print("Serving model from MLflow artifact")
     print("=" * 50)
     load_model()
-    print("\nPOST /predict  |  GET /health  |  GET /metrics")
+    print("\nPOST /predict | GET /health | GET /metrics")
     print("Starting on http://0.0.0.0:5001")
     app.run(host='0.0.0.0', port=5001, debug=False)

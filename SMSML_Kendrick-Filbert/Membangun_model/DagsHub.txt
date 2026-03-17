@@ -1,1 +1,4 @@
 https://dagshub.com/kendrickassignment/Membangun_model
+
+
+https://dagshub.com/kendrickassignment/Membangun_model.mlflow/#/experiments/0/runs/c3ae0739d70c4ee4b600a2a40655f65b/artifacts (MLFlow)
